@@ -13,7 +13,6 @@ use chrono::Utc;
 use hearsay_audio::{MicCapture, start_mic};
 use hearsay_core::{Segment, SessionId, SessionMeta, SessionStatus, SourceKind, Summary};
 use hearsay_storage::{AudioWriter, Storage, WavAudioWriter};
-use hearsay_summarize::Summarizer;
 use hearsay_transcribe::{TranscribedSegment, TranscriberConfig, TranscriptionWorker};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -22,6 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::error::ApiError;
+use crate::summarize_child;
 
 const LIVE_BROADCAST_CAPACITY: usize = 256;
 
@@ -47,20 +47,14 @@ struct Active {
 pub struct SessionManager {
     storage: Storage,
     config: Arc<Config>,
-    summarizer: Option<Arc<Summarizer>>,
     active: Mutex<HashMap<SessionId, Active>>,
 }
 
 impl SessionManager {
-    pub fn new(
-        storage: Storage,
-        config: Arc<Config>,
-        summarizer: Option<Arc<Summarizer>>,
-    ) -> Self {
+    pub fn new(storage: Storage, config: Arc<Config>) -> Self {
         Self {
             storage,
             config,
-            summarizer,
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -225,46 +219,44 @@ impl SessionManager {
             .get_session(id)?
             .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
 
-        // Fire-and-forget auto-summarize. The session is already marked
-        // Completed; the summary appears in storage when it's ready.
-        if let Some(summarizer) = self.summarizer.clone() {
+        // Fire-and-forget auto-summarize via the worker child process.
+        {
             let storage = self.storage.clone();
+            let config = Arc::clone(&self.config);
             let language = meta.language.clone();
-            let model_label = self.config.summarization.model.clone();
             tokio::spawn(async move {
-                run_summarization(storage, summarizer, id, language, model_label).await;
+                run_summarization(storage, config, id, language).await;
             });
         }
 
         Ok(meta)
     }
 
-    /// Synchronously trigger summarization for a completed session. Used
-    /// by `POST /api/sessions/:id/summarize` so the user can re-summarize
-    /// or pick a different model later without restarting recording.
+    /// Synchronously trigger summarization for a completed session via the
+    /// summarize child process. Used by `POST /api/sessions/:id/summarize`.
     pub async fn resummarize(&self, id: SessionId) -> Result<Summary, ApiError> {
-        let Some(summarizer) = self.summarizer.clone() else {
-            return Err(ApiError::BadRequest(
-                "summarization model not loaded — set summarization.model_path and restart".into(),
-            ));
-        };
         let meta = self
             .storage
             .get_session(id)?
             .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
         let segments = self.storage.list_segments(id)?;
+        if segments.is_empty() {
+            return Err(ApiError::BadRequest("no transcript yet".into()));
+        }
         let language = meta.language;
-        let storage = self.storage.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            summarizer.summarize(&segments, language.as_deref())
-        })
+        let child_binary = resolve_child_binary(&self.config);
+        let data_dir = self.config.resolved_data_dir();
+        let content = summarize_child::run(
+            &self.config.summarization,
+            &data_dir,
+            &child_binary,
+            &segments,
+            language.as_deref(),
+        )
         .await
-        .map_err(|e| ApiError::Internal(format!("summarize join: {e}")))?;
-
-        let content = result.map_err(|e| match e {
-            hearsay_summarize::SummarizeError::EmptyTranscript => {
-                ApiError::BadRequest("no transcript yet".into())
+        .map_err(|e| match e {
+            summarize_child::SummarizeChildError::BinaryMissing(p) => {
+                ApiError::BadRequest(format!("summarize worker binary not found at `{}`", p.display()))
             }
             other => ApiError::Internal(format!("summarize: {other}")),
         })?;
@@ -275,7 +267,7 @@ impl SessionManager {
             content,
             generated_at: Utc::now(),
         };
-        storage.upsert_summary(&summary)?;
+        self.storage.upsert_summary(&summary)?;
         Ok(summary)
     }
 
@@ -290,10 +282,9 @@ impl SessionManager {
 
 async fn run_summarization(
     storage: Storage,
-    summarizer: Arc<Summarizer>,
+    config: Arc<Config>,
     id: SessionId,
     language: Option<String>,
-    model_label: String,
 ) {
     let segments = match storage.list_segments(id) {
         Ok(s) => s,
@@ -307,27 +298,27 @@ async fn run_summarization(
         return;
     }
 
-    let language_for_call = language.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        summarizer.summarize(&segments, language_for_call.as_deref())
-    })
-    .await;
-
-    let content = match result {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::warn!(?e, %id, "summarization failed");
-            return;
-        }
+    let child_binary = resolve_child_binary(&config);
+    let data_dir = config.resolved_data_dir();
+    let content = match summarize_child::run(
+        &config.summarization,
+        &data_dir,
+        &child_binary,
+        &segments,
+        language.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => c,
         Err(e) => {
-            tracing::error!(?e, %id, "summarize task panicked");
+            tracing::warn!(?e, %id, "auto-summarization failed");
             return;
         }
     };
 
     let summary = Summary {
         session_id: id,
-        model: model_label,
+        model: config.summarization.model.clone(),
         content,
         generated_at: Utc::now(),
     };
@@ -336,4 +327,12 @@ async fn run_summarization(
     } else {
         tracing::info!(%id, "summary stored");
     }
+}
+
+fn resolve_child_binary(config: &Config) -> std::path::PathBuf {
+    config
+        .summarization
+        .child_binary
+        .clone()
+        .unwrap_or_else(summarize_child::default_child_path)
 }

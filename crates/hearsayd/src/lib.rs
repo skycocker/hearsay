@@ -6,6 +6,7 @@ pub mod error;
 pub mod routes;
 pub mod session_manager;
 pub mod state;
+pub mod summarize_child;
 #[cfg(feature = "tray")]
 pub mod tray;
 

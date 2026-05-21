@@ -87,6 +87,11 @@ pub struct SummarizationConfig {
     /// afterwards. When `true` (default), it stays resident — fast at the
     /// cost of ~7 GB RAM held for Gemma 12B Q4.
     pub keep_loaded: bool,
+    /// Path to the `hearsay-summarize-child` worker binary. We must spawn
+    /// summarization in a child process to avoid an llama-cpp-2 +
+    /// whisper-rs collision (see crates/hearsayd/src/bin/...child.rs).
+    /// Default: alongside the daemon binary.
+    pub child_binary: Option<PathBuf>,
 }
 
 impl Default for SummarizationConfig {
@@ -98,6 +103,7 @@ impl Default for SummarizationConfig {
             n_gpu_layers: 999,
             max_tokens: 1_500,
             keep_loaded: true,
+            child_binary: None,
         }
     }
 }

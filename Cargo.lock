@@ -1163,6 +1163,7 @@ dependencies = [
  "hearsay-storage",
  "hearsay-summarize",
  "hearsay-transcribe",
+ "hound",
  "http-body-util",
  "image",
  "mime_guess",

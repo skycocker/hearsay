@@ -14,8 +14,8 @@ name = "hearsay-pipeline"
 path = "src/bin/hearsay-pipeline.rs"
 
 [[bin]]
-name = "hearsay-summarize-test"
-path = "src/bin/hearsay-summarize-test.rs"
+name = "hearsay-summarize-child"
+path = "src/bin/hearsay-summarize-child.rs"
 
 [dependencies]
 hearsay-core.workspace = true
