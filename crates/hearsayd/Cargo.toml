@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "hearsay-pipeline"
 path = "src/bin/hearsay-pipeline.rs"
 
+[[bin]]
+name = "hearsay-summarize-test"
+path = "src/bin/hearsay-summarize-test.rs"
+
 [dependencies]
 hearsay-core.workspace = true
 hearsay-audio.workspace = true
