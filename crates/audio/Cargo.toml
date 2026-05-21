@@ -14,5 +14,9 @@ thiserror.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 
+cpal = "0.15"
+rubato = "0.15"
+crossbeam-channel = "0.5"
+
 [lints]
 workspace = true
