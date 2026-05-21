@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import type { Segment, SessionMeta, WsEvent } from "../lib/types";
+  import type { Segment, SessionMeta, Summary, WsEvent } from "../lib/types";
   import { api, ws } from "../lib/api";
   import { formatDate, formatDuration } from "../lib/format";
 
@@ -8,14 +8,22 @@
 
   let session = $state<SessionMeta | null>(null);
   let segments = $state<Segment[]>([]);
+  let summaries = $state<Summary[]>([]);
   let error = $state<string | null>(null);
   let socket: WebSocket | null = null;
   let stopping = $state(false);
   let speed = $state(1);
+  let summarizing = $state(false);
 
   async function refreshMeta() {
     try {
       session = await api.getSession(id);
+      summaries = await api.listSummaries(id);
+      // For completed sessions, also fetch stored segments so we have them
+      // before WS replay arrives.
+      if (session?.status !== "active") {
+        segments = await api.listSegments(id);
+      }
     } catch (e) {
       error = (e as Error).message;
     }
@@ -27,10 +35,12 @@
       socket.close();
       socket = null;
     }
-    segments = [];
     if (session.status === "active") {
+      // Keep already-stored segments visible, append new ones from WS.
       socket = ws.live(id);
     } else {
+      // Replay: clear and re-stream at cadence.
+      segments = [];
       socket = ws.replay(id, { speed });
     }
     socket.onmessage = (ev) => {
@@ -44,9 +54,7 @@
         }
       } catch {}
     };
-    socket.onerror = () => {
-      // Live socket on a non-active session 404s — that's expected.
-    };
+    socket.onerror = () => {};
   }
 
   async function stop() {
@@ -62,6 +70,18 @@
     }
   }
 
+  async function generateSummary() {
+    summarizing = true;
+    try {
+      const fresh = await api.summarize(id);
+      summaries = [fresh, ...summaries.filter((s) => s.model !== fresh.model)];
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      summarizing = false;
+    }
+  }
+
   function changeSpeed(next: number) {
     speed = next;
     openSocket();
@@ -71,7 +91,19 @@
     if (session) openSocket();
   });
 
-  onMount(refreshMeta);
+  onMount(() => {
+    refreshMeta();
+    // Poll for summary updates on completed sessions — auto-summary
+    // is fire-and-forget and lands when ready.
+    const interval = setInterval(async () => {
+      if (session && session.status !== "active") {
+        try {
+          summaries = await api.listSummaries(id);
+        } catch {}
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  });
   onDestroy(() => socket?.close());
 </script>
 
@@ -109,6 +141,29 @@
   </header>
 
   {#if session.status !== "active"}
+    <section class="summary">
+      <div class="summary-head">
+        <h2>Summary</h2>
+        <button onclick={generateSummary} disabled={summarizing}>
+          {summarizing ? "Generating…" : summaries.length > 0 ? "Re-generate" : "Generate"}
+        </button>
+      </div>
+      {#if summaries.length === 0}
+        <p class="muted small">No summary yet. The daemon auto-summarizes after stop if the Gemma model is loaded — otherwise click Generate.</p>
+      {:else}
+        {#each summaries as s (s.model)}
+          <article class="summary-card">
+            <div class="summary-meta">
+              <span>{s.model}</span>
+              <span>•</span>
+              <span>{formatDate(s.generated_at)}</span>
+            </div>
+            <div class="summary-content">{@html renderMarkdown(s.content)}</div>
+          </article>
+        {/each}
+      {/if}
+    </section>
+
     <div class="controls">
       Replay speed:
       {#each [0.5, 1, 1.5, 2, 4] as s (s)}
@@ -122,7 +177,7 @@
       <div class="muted">
         {session.status === "active"
           ? "Listening… transcript will appear as soon as the first segment lands."
-          : "No transcript yet — transcription runs once the session is stopped (task #6)."}
+          : "No transcript stored — transcription may not have run."}
       </div>
     {:else}
       <ul>
@@ -139,6 +194,29 @@
     {/if}
   </section>
 {/if}
+
+<script lang="ts" module>
+  // Minimal Markdown rendering: headings (## / ###), bullets (- / *), bold
+  // (**x**), and italics (*x*). Newlines become <br>. Enough to render
+  // Gemma's summary output without pulling in marked/markdown-it.
+  export function renderMarkdown(src: string): string {
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let html = esc(src);
+    html = html.replace(/^### (.+)$/gm, "<h4>$1</h4>");
+    html = html.replace(/^## (.+)$/gm, "<h3>$1</h3>");
+    html = html.replace(/^# (.+)$/gm, "<h2>$1</h2>");
+    html = html.replace(/^\s*[-*] (.+)$/gm, "<li>$1</li>");
+    // Wrap consecutive <li> into <ul>.
+    html = html.replace(/(<li>[\s\S]*?<\/li>)(\n(?=<li>))/g, "$1");
+    html = html.replace(/(<li>[\s\S]*?<\/li>(?:\n<li>[\s\S]*?<\/li>)*)/g, "<ul>$1</ul>");
+    html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    html = html.replace(/\n{2,}/g, "</p><p>");
+    html = `<p>${html}</p>`;
+    return html;
+  }
+</script>
 
 <style>
   .back {
@@ -200,6 +278,74 @@
     background: #b73a2b;
     color: #fff;
     border-color: #b73a2b;
+  }
+  .summary {
+    background: #fff;
+    border: 1px solid #e5e5e3;
+    border-radius: 8px;
+    padding: 0.85rem 1.1rem;
+    margin-bottom: 0.75rem;
+  }
+  .summary-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+  .summary-head h2 {
+    margin: 0;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .summary-head button {
+    padding: 0.3rem 0.8rem;
+    font: inherit;
+    border-radius: 4px;
+    border: 1px solid #d0d0cc;
+    background: #fff;
+    cursor: pointer;
+    color: #1a1a1a;
+    font-size: 0.85rem;
+  }
+  .summary-head button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .summary-card {
+    border-top: 1px solid #f0f0ee;
+    padding-top: 0.6rem;
+    margin-top: 0.6rem;
+  }
+  .summary-card:first-of-type {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+  }
+  .summary-meta {
+    display: flex;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: #999;
+    margin-bottom: 0.4rem;
+  }
+  .summary-content :global(h2),
+  .summary-content :global(h3) {
+    font-size: 0.95rem;
+    margin: 0.6rem 0 0.25rem 0;
+  }
+  .summary-content :global(ul) {
+    margin: 0.2rem 0 0.6rem 1.2rem;
+    padding: 0;
+  }
+  .summary-content :global(li) {
+    margin: 0.15rem 0;
+  }
+  .summary-content :global(p) {
+    margin: 0.2rem 0;
+    line-height: 1.45;
   }
   .controls {
     display: flex;
@@ -266,6 +412,11 @@
     color: #999;
     padding: 1rem;
     text-align: center;
+  }
+  .muted.small {
+    padding: 0.5rem 0;
+    font-size: 0.85rem;
+    text-align: left;
   }
   .error {
     color: #872a1f;

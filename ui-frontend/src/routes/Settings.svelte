@@ -37,6 +37,10 @@
     <dt>Default language</dt><dd>{config.transcription.default_language}</dd>
 
     <dt>Summarization model</dt><dd>{config.summarization.model}</dd>
+    <dt>Summarizer model path</dt><dd>{config.summarization.model_path ?? "(derived from model name)"}</dd>
+    <dt>Context window</dt><dd>{config.summarization.n_ctx.toLocaleString()} tokens</dd>
+    <dt>GPU layers</dt><dd>{config.summarization.n_gpu_layers}</dd>
+    <dt>Max summary tokens</dt><dd>{config.summarization.max_tokens.toLocaleString()}</dd>
     <dt>Keep summarizer loaded</dt><dd>{config.summarization.keep_loaded ? "yes" : "no"}</dd>
   </dl>
 {:else if !error}

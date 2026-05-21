@@ -60,7 +60,14 @@ export interface Config {
     n_threads: number;
     default_language: string;
   };
-  summarization: { model: string; keep_loaded: boolean };
+  summarization: {
+    model: string;
+    model_path: string | null;
+    n_ctx: number;
+    n_gpu_layers: number;
+    max_tokens: number;
+    keep_loaded: boolean;
+  };
 }
 
 // WS event envelope used by both /live and /replay.

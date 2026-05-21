@@ -74,18 +74,40 @@ impl TranscriptionConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SummarizationConfig {
+    /// Logical model name — used to build the default path
+    /// `<data_dir>/models/<model>.gguf` when `model_path` is unset.
     pub model: String,
+    pub model_path: Option<PathBuf>,
+    pub n_ctx: u32,
+    /// `999` = all layers on GPU (default), `0` = pure CPU.
+    pub n_gpu_layers: u32,
+    /// Hard cap on generated tokens per summary.
+    pub max_tokens: u32,
     /// When `false`, the model is loaded per summarization job and freed
-    /// afterwards. When `true`, it's kept resident for fast follow-ups.
+    /// afterwards. When `true` (default), it stays resident — fast at the
+    /// cost of ~7 GB RAM held for Gemma 12B Q4.
     pub keep_loaded: bool,
 }
 
 impl Default for SummarizationConfig {
     fn default() -> Self {
         Self {
-            model: "gemma3-12b-q4".into(),
+            model: "gemma-3-12b".into(),
+            model_path: None,
+            n_ctx: 32_768,
+            n_gpu_layers: 999,
+            max_tokens: 1_500,
             keep_loaded: true,
         }
+    }
+}
+
+impl SummarizationConfig {
+    pub fn resolved_model_path(&self, data_dir: &Path) -> PathBuf {
+        if let Some(p) = &self.model_path {
+            return p.clone();
+        }
+        data_dir.join("models").join(format!("{}.gguf", self.model))
     }
 }
 
@@ -136,7 +158,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = Config::load_from(&dir.path().join("nonexistent.toml")).unwrap();
         assert_eq!(cfg.server.port, 7717);
-        assert_eq!(cfg.summarization.model, "gemma3-12b-q4");
+        assert_eq!(cfg.summarization.model, "gemma-3-12b");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // from window.location so the same bundle works whether it's served by the
 // daemon (production) or proxied by Vite (dev).
 
-import type { Config, InputDevice, SessionMeta } from "./types";
+import type { Config, InputDevice, Segment, SessionMeta, Summary } from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -49,6 +49,15 @@ export const api = {
     }),
 
   audioUrl: (id: string) => `/api/sessions/${id}/audio`,
+
+  listSegments: (id: string) =>
+    fetch(`/api/sessions/${id}/segments`).then(json<Segment[]>),
+
+  listSummaries: (id: string) =>
+    fetch(`/api/sessions/${id}/summaries`).then(json<Summary[]>),
+
+  summarize: (id: string) =>
+    fetch(`/api/sessions/${id}/summarize`, { method: "POST" }).then(json<Summary>),
 };
 
 // Build a ws:// or wss:// URL against the host the page was served from.

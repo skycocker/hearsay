@@ -201,7 +201,7 @@ async fn get_config_returns_loaded_defaults() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["server"]["port"], 7717);
-    assert_eq!(body["summarization"]["model"], "gemma3-12b-q4");
+    assert_eq!(body["summarization"]["model"], "gemma-3-12b");
 }
 
 #[tokio::test]
@@ -251,6 +251,90 @@ async fn audio_download_streams_wav_file() {
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(bytes.as_ref(), expected_bytes.as_slice());
+}
+
+#[tokio::test]
+async fn summarize_400_when_no_model_loaded() {
+    // In tests, no Gemma model is present on disk, so AppState::new
+    // resolves summarizer to None. /summarize should reject cleanly.
+    let dir = tempfile::tempdir().unwrap();
+    let app = build(dir.path());
+
+    let storage = Storage::open(dir.path().join("h.db")).unwrap();
+    let id = SessionId::new();
+    storage
+        .insert_session(&SessionMeta {
+            id,
+            name: "test".into(),
+            source_kind: SourceKind::Mic,
+            source_meta: serde_json::Value::Null,
+            language: None,
+            audio_path: dir.path().join("a.wav"),
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Completed,
+        })
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{id}/summarize"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().unwrap().contains("model"));
+}
+
+#[tokio::test]
+async fn segments_and_summaries_endpoints_return_arrays() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build(dir.path());
+    let storage = Storage::open(dir.path().join("h.db")).unwrap();
+    let id = SessionId::new();
+    storage
+        .insert_session(&SessionMeta {
+            id,
+            name: "seg".into(),
+            source_kind: SourceKind::Mic,
+            source_meta: serde_json::Value::Null,
+            language: None,
+            audio_path: dir.path().join("x.wav"),
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Completed,
+        })
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/segments"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await.is_array());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/summaries"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await.is_array());
 }
 
 #[tokio::test]

@@ -21,7 +21,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sessions", get(sessions::list).post(sessions::create))
         .route("/sessions/{id}", get(sessions::get_one).delete(sessions::delete))
         .route("/sessions/{id}/stop", post(sessions::stop))
-        .route("/sessions/{id}/audio", get(audio::download));
+        .route("/sessions/{id}/audio", get(audio::download))
+        .route("/sessions/{id}/segments", get(sessions::list_segments))
+        .route("/sessions/{id}/summaries", get(sessions::list_summaries))
+        .route("/sessions/{id}/summarize", post(sessions::summarize));
 
     let ws_routes = Router::new()
         .route("/sessions/{id}/live", get(ws::live))

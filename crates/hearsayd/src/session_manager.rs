@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use hearsay_audio::{MicCapture, start_mic};
-use hearsay_core::{Segment, SessionId, SessionMeta, SessionStatus, SourceKind};
+use hearsay_core::{Segment, SessionId, SessionMeta, SessionStatus, SourceKind, Summary};
 use hearsay_storage::{AudioWriter, Storage, WavAudioWriter};
+use hearsay_summarize::Summarizer;
 use hearsay_transcribe::{TranscribedSegment, TranscriberConfig, TranscriptionWorker};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -46,14 +47,20 @@ struct Active {
 pub struct SessionManager {
     storage: Storage,
     config: Arc<Config>,
+    summarizer: Option<Arc<Summarizer>>,
     active: Mutex<HashMap<SessionId, Active>>,
 }
 
 impl SessionManager {
-    pub fn new(storage: Storage, config: Arc<Config>) -> Self {
+    pub fn new(
+        storage: Storage,
+        config: Arc<Config>,
+        summarizer: Option<Arc<Summarizer>>,
+    ) -> Self {
         Self {
             storage,
             config,
+            summarizer,
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -217,7 +224,59 @@ impl SessionManager {
             .storage
             .get_session(id)?
             .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
+
+        // Fire-and-forget auto-summarize. The session is already marked
+        // Completed; the summary appears in storage when it's ready.
+        if let Some(summarizer) = self.summarizer.clone() {
+            let storage = self.storage.clone();
+            let language = meta.language.clone();
+            let model_label = self.config.summarization.model.clone();
+            tokio::spawn(async move {
+                run_summarization(storage, summarizer, id, language, model_label).await;
+            });
+        }
+
         Ok(meta)
+    }
+
+    /// Synchronously trigger summarization for a completed session. Used
+    /// by `POST /api/sessions/:id/summarize` so the user can re-summarize
+    /// or pick a different model later without restarting recording.
+    pub async fn resummarize(&self, id: SessionId) -> Result<Summary, ApiError> {
+        let Some(summarizer) = self.summarizer.clone() else {
+            return Err(ApiError::BadRequest(
+                "summarization model not loaded — set summarization.model_path and restart".into(),
+            ));
+        };
+        let meta = self
+            .storage
+            .get_session(id)?
+            .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
+        let segments = self.storage.list_segments(id)?;
+        let language = meta.language;
+        let storage = self.storage.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            summarizer.summarize(&segments, language.as_deref())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("summarize join: {e}")))?;
+
+        let content = result.map_err(|e| match e {
+            hearsay_summarize::SummarizeError::EmptyTranscript => {
+                ApiError::BadRequest("no transcript yet".into())
+            }
+            other => ApiError::Internal(format!("summarize: {other}")),
+        })?;
+
+        let summary = Summary {
+            session_id: id,
+            model: self.config.summarization.model.clone(),
+            content,
+            generated_at: Utc::now(),
+        };
+        storage.upsert_summary(&summary)?;
+        Ok(summary)
     }
 
     pub fn is_active(&self, id: SessionId) -> bool {
@@ -226,5 +285,55 @@ impl SessionManager {
 
     pub fn active_ids(&self) -> Vec<SessionId> {
         self.active.lock().keys().copied().collect()
+    }
+}
+
+async fn run_summarization(
+    storage: Storage,
+    summarizer: Arc<Summarizer>,
+    id: SessionId,
+    language: Option<String>,
+    model_label: String,
+) {
+    let segments = match storage.list_segments(id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(?e, %id, "list_segments failed during summarization");
+            return;
+        }
+    };
+    if segments.is_empty() {
+        tracing::info!(%id, "no segments to summarize; skipping");
+        return;
+    }
+
+    let language_for_call = language.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        summarizer.summarize(&segments, language_for_call.as_deref())
+    })
+    .await;
+
+    let content = match result {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::warn!(?e, %id, "summarization failed");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(?e, %id, "summarize task panicked");
+            return;
+        }
+    };
+
+    let summary = Summary {
+        session_id: id,
+        model: model_label,
+        content,
+        generated_at: Utc::now(),
+    };
+    if let Err(e) = storage.upsert_summary(&summary) {
+        tracing::error!(?e, %id, "failed to store summary");
+    } else {
+        tracing::info!(%id, "summary stored");
     }
 }

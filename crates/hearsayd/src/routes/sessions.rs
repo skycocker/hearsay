@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use hearsay_core::{SessionId, SessionMeta};
+use hearsay_core::{SessionId, SessionMeta, Summary};
 use serde::Deserialize;
 
 use crate::error::{ApiError, ApiResult};
@@ -75,6 +75,36 @@ pub async fn stop(
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid session id: {id}")))?;
     Ok(Json(state.sessions.stop(id).await?))
+}
+
+pub async fn list_summaries(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<Summary>>> {
+    let id: SessionId = id
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("invalid session id: {id}")))?;
+    Ok(Json(state.storage.list_summaries(id)?))
+}
+
+pub async fn summarize(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Summary>> {
+    let id: SessionId = id
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("invalid session id: {id}")))?;
+    Ok(Json(state.sessions.resummarize(id).await?))
+}
+
+pub async fn list_segments(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<hearsay_core::Segment>>> {
+    let id: SessionId = id
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("invalid session id: {id}")))?;
+    Ok(Json(state.storage.list_segments(id)?))
 }
 
 fn default_session_name() -> String {
