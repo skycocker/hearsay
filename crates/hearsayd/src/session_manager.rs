@@ -1,27 +1,27 @@
 //! Tracks live recording sessions in memory and keeps their associated cpal
-//! stream + WAV writer alive for the duration of the recording.
+//! stream + WAV writer + (optional) transcription worker alive for the
+//! duration of the recording.
 //!
 //! The HTTP layer goes through this manager — it never touches cpal or the
 //! audio writer directly. That lets us swap sources (system audio, Meet
 //! sidecar, synthetic test source) without touching routes.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::Utc;
 use hearsay_audio::{MicCapture, start_mic};
 use hearsay_core::{Segment, SessionId, SessionMeta, SessionStatus, SourceKind};
 use hearsay_storage::{AudioWriter, Storage, WavAudioWriter};
+use hearsay_transcribe::{TranscribedSegment, TranscriberConfig, TranscriptionWorker};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 
+use crate::config::Config;
 use crate::error::ApiError;
 
-/// Capacity of the per-session live transcript broadcast. Big enough that
-/// a slow WS client doesn't drop segments under normal speaking pace, small
-/// enough that a totally-stalled subscriber doesn't pin the whole session's
-/// transcript in RAM.
 const LIVE_BROADCAST_CAPACITY: usize = 256;
 
 /// Per-source-kind parameters needed at session start.
@@ -33,30 +33,31 @@ pub enum StartParams {
 struct Active {
     /// Dropping this stops the cpal stream and joins the worker thread.
     capture: MicCapture,
+    /// Drains audio frames, writes WAV, feeds the transcriber.
     consumer: JoinHandle<()>,
-    /// Producer side for the live-transcript WS. Dropping this when the
-    /// session ends gives all live subscribers a clean disconnect signal.
+    /// Pumps transcribed segments into storage + the live broadcast.
+    /// `None` when no model is available — session still records audio,
+    /// transcript is just empty.
+    pumper: Option<JoinHandle<()>>,
+    /// Producer side for the live-transcript WS. Cloned per subscriber.
     live_tx: broadcast::Sender<Segment>,
 }
 
 pub struct SessionManager {
     storage: Storage,
-    data_dir: PathBuf,
+    config: Arc<Config>,
     active: Mutex<HashMap<SessionId, Active>>,
 }
 
 impl SessionManager {
-    pub fn new(storage: Storage, data_dir: PathBuf) -> Self {
+    pub fn new(storage: Storage, config: Arc<Config>) -> Self {
         Self {
             storage,
-            data_dir,
+            config,
             active: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Begin a new session. Persists [`SessionMeta`] in storage, opens the
-    /// audio source, and spawns a task that drains frames into the WAV
-    /// writer. Returns the metadata so the HTTP layer can hand it back.
     pub fn start(
         &self,
         name: String,
@@ -75,7 +76,8 @@ impl SessionManager {
         device_id: Option<String>,
     ) -> Result<SessionMeta, ApiError> {
         let id = SessionId::new();
-        let dir = self.data_dir.join("sessions").join(id.to_string());
+        let data_dir = self.config.resolved_data_dir();
+        let dir = data_dir.join("sessions").join(id.to_string());
         std::fs::create_dir_all(&dir).map_err(|e| ApiError::Internal(e.to_string()))?;
         let audio_path = dir.join("audio.wav");
 
@@ -84,7 +86,7 @@ impl SessionManager {
             name,
             source_kind: SourceKind::Mic,
             source_meta: serde_json::json!({ "device_id": device_id }),
-            language,
+            language: language.clone(),
             audio_path: audio_path.clone(),
             started_at: Utc::now(),
             ended_at: None,
@@ -96,61 +98,119 @@ impl SessionManager {
         let writer = WavAudioWriter::create(&audio_path)?;
         let mut writer: Box<dyn AudioWriter> = Box::new(writer);
 
-        let storage = self.storage.clone();
+        // Best-effort transcription start. If the model isn't downloaded,
+        // we still record audio and warn — the user can transcribe later
+        // (once the post-hoc transcribe endpoint lands).
+        let (transcribe_worker, transcribe_rx): (Option<TranscriptionWorker>, Option<UnboundedReceiver<TranscribedSegment>>) = {
+            let model_path = self.config.transcription.resolved_model_path(&data_dir);
+            let lang = match language.as_deref() {
+                Some("auto") | None => None,
+                Some(other) => Some(other.to_owned()),
+            };
+            let cfg = TranscriberConfig {
+                model_path: model_path.clone(),
+                language: lang,
+                n_threads: self.config.transcription.n_threads,
+            };
+            match TranscriptionWorker::start(cfg) {
+                Ok((w, rx)) => (Some(w), Some(rx)),
+                Err(e) => {
+                    tracing::warn!(?e, %id, model_path = %model_path.display(),
+                        "transcription disabled for this session; audio still recording");
+                    (None, None)
+                }
+            }
+        };
+
+        let (live_tx, _initial_rx) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
+
+        // Consumer task: drains audio frames, writes WAV, feeds transcribe.
+        // Owns transcribe_worker — when this task ends, dropping the worker
+        // closes its audio channel, triggering a flush.
+        let storage_consumer = self.storage.clone();
         let consumer = tokio::spawn(async move {
+            let worker = transcribe_worker;
             while let Some(frame) = frame_rx.recv().await {
                 if let Err(e) = writer.write_pcm(&frame.pcm) {
-                    tracing::error!(?e, %id, "wav writer failed; ending session");
-                    let _ = storage.finish_session(id, SessionStatus::Failed, Utc::now());
+                    tracing::error!(?e, %id, "WAV writer failed; ending session");
+                    let _ = storage_consumer.finish_session(id, SessionStatus::Failed, Utc::now());
                     return;
                 }
-                // TODO(task #6): forward frame to transcription queue here.
+                if let Some(w) = &worker {
+                    // Feeding a closed transcriber returns Err — drop the
+                    // reference so we stop trying.
+                    if w.feed(frame.pcm).is_err() {
+                        tracing::warn!(%id, "transcribe worker closed early");
+                    }
+                }
             }
-            // Channel closed (stream stopped). Finalize the WAV.
             if let Err(e) = writer.finalize() {
-                tracing::error!(?e, %id, "finalize failed");
+                tracing::error!(?e, %id, "WAV finalize failed");
             }
+            // Dropping `worker` here lets it flush its tail chunk.
+            drop(worker);
         });
 
-        let (live_tx, _live_rx_drop) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
-        self.active
-            .lock()
-            .insert(id, Active { capture, consumer, live_tx });
+        // Pumper task: forwards transcribed segments → storage + live WS.
+        // Spawned only when transcription is active.
+        let pumper = transcribe_rx.map(|mut rx| {
+            let storage_pump = self.storage.clone();
+            let live = live_tx.clone();
+            tokio::spawn(async move {
+                let mut seq: u32 = 0;
+                while let Some(seg) = rx.recv().await {
+                    let stored = Segment {
+                        session_id: id,
+                        seq,
+                        start_ms: seg.start_ms,
+                        end_ms: seg.end_ms,
+                        text: seg.text,
+                        language: seg.language,
+                        confidence: None,
+                        speaker_id: None,
+                    };
+                    if let Err(e) = storage_pump.insert_segment(&stored) {
+                        tracing::error!(?e, %id, "failed to persist segment");
+                    }
+                    // Broadcast errors are normal (no live viewers) — ignore.
+                    let _ = live.send(stored);
+                    seq += 1;
+                }
+            })
+        });
+
+        self.active.lock().insert(
+            id,
+            Active {
+                capture,
+                consumer,
+                pumper,
+                live_tx,
+            },
+        );
 
         Ok(meta)
     }
 
     /// Subscribe to the live transcript stream for an active session.
-    /// Returns `None` if the session isn't active.
     pub fn subscribe_live(&self, id: SessionId) -> Option<broadcast::Receiver<Segment>> {
         self.active.lock().get(&id).map(|a| a.live_tx.subscribe())
     }
 
-    /// Publish a transcript segment to the live broadcast. Returns the
-    /// number of subscribers reached (0 is normal — nobody might be
-    /// watching). Called by the transcription pipeline (task #6).
-    #[allow(dead_code)]
-    pub fn publish_segment(&self, id: SessionId, seg: Segment) -> usize {
-        self.active
-            .lock()
-            .get(&id)
-            .map(|a| a.live_tx.send(seg).unwrap_or(0))
-            .unwrap_or(0)
-    }
-
-    /// Stop a session: drop the capture (closes cpal stream), let the
-    /// consumer task finalize the WAV, mark the session Completed.
     pub async fn stop(&self, id: SessionId) -> Result<SessionMeta, ApiError> {
         let active = self
             .active
             .lock()
             .remove(&id)
             .ok_or_else(|| ApiError::NotFound(format!("active session {id}")))?;
-        // Drop capture → closes cpal stream → frame_rx returns None → consumer
-        // task ends. We just need to await it so the WAV is fully flushed
-        // before we return.
+        // Drop capture → cpal stops → frame_rx returns None → consumer task
+        // ends → drops transcribe_worker → transcriber flushes tail →
+        // segment_rx closes → pumper exits.
         drop(active.capture);
         let _ = active.consumer.await;
+        if let Some(pumper) = active.pumper {
+            let _ = pumper.await;
+        }
 
         self.storage.finish_session(id, SessionStatus::Completed, Utc::now())?;
         let meta = self
@@ -168,4 +228,3 @@ impl SessionManager {
         self.active.lock().keys().copied().collect()
     }
 }
-

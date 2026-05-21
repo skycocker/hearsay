@@ -12,6 +12,20 @@ tokio-stream.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
+parking_lot.workspace = true
+crossbeam-channel = "0.5"
+
+# whisper.cpp via whisper-rs. Metal acceleration is on for Apple Silicon;
+# CoreML disabled to keep build deps lighter (we can flip it later).
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.14", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.14" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+dirs = { workspace = true }
 
 [lints]
 workspace = true

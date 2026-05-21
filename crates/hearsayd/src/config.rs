@@ -39,8 +39,12 @@ pub struct PathsConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranscriptionConfig {
+    /// Whisper.cpp model name — used to build the default path
+    /// `<data_dir>/models/ggml-<model>.bin` when `model_path` is unset.
     pub model: String,
-    pub workers: u8,
+    /// Explicit override for the model file. Takes precedence over `model`.
+    pub model_path: Option<PathBuf>,
+    pub n_threads: i32,
     /// ISO-639-1 language, or `"auto"` for Whisper's detector.
     pub default_language: String,
 }
@@ -48,10 +52,22 @@ pub struct TranscriptionConfig {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
-            model: "whisper-large-v3-turbo".into(),
-            workers: 2,
+            model: "large-v3-turbo".into(),
+            model_path: None,
+            n_threads: 4,
             default_language: "auto".into(),
         }
+    }
+}
+
+impl TranscriptionConfig {
+    /// Resolve the model file path. Explicit `model_path` wins; otherwise
+    /// build it from `model` under `<data_dir>/models/`.
+    pub fn resolved_model_path(&self, data_dir: &Path) -> PathBuf {
+        if let Some(p) = &self.model_path {
+            return p.clone();
+        }
+        data_dir.join("models").join(format!("ggml-{}.bin", self.model))
     }
 }
 
@@ -131,7 +147,7 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.server.port, 9000);
         assert_eq!(cfg.server.host, "127.0.0.1"); // default still applied
-        assert_eq!(cfg.transcription.model, "whisper-large-v3-turbo");
+        assert_eq!(cfg.transcription.model, "large-v3-turbo");
     }
 
     #[test]

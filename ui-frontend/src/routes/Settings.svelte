@@ -32,7 +32,8 @@
     <dt>Data directory</dt><dd>{config.paths.data_dir ?? "(platform default)"}</dd>
 
     <dt>Transcription model</dt><dd>{config.transcription.model}</dd>
-    <dt>Transcription workers</dt><dd>{config.transcription.workers}</dd>
+    <dt>Model path</dt><dd>{config.transcription.model_path ?? "(derived from model name)"}</dd>
+    <dt>Whisper threads</dt><dd>{config.transcription.n_threads}</dd>
     <dt>Default language</dt><dd>{config.transcription.default_language}</dd>
 
     <dt>Summarization model</dt><dd>{config.summarization.model}</dd>

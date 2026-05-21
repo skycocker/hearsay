@@ -16,9 +16,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, storage: Storage) -> Self {
-        let sessions = Arc::new(SessionManager::new(storage.clone(), config.resolved_data_dir()));
+        let config = Arc::new(config);
+        let sessions = Arc::new(SessionManager::new(
+            storage.clone(),
+            Arc::clone(&config),
+        ));
         Self {
-            config: Arc::new(config),
+            config,
             storage,
             sessions,
         }

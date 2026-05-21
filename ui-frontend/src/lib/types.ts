@@ -54,7 +54,12 @@ export interface InputDevice {
 export interface Config {
   server: { host: string; port: number };
   paths: { data_dir: string | null };
-  transcription: { model: string; workers: number; default_language: string };
+  transcription: {
+    model: string;
+    model_path: string | null;
+    n_threads: number;
+    default_language: string;
+  };
   summarization: { model: string; keep_loaded: boolean };
 }
 
