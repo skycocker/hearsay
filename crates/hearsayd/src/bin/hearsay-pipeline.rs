@@ -14,12 +14,12 @@
 //!     hearsay-pipeline <audio.wav> --whisper PATH [--gemma PATH] [--language LANG]
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::Instant;
 
 use hearsay_core::{Segment, SessionId};
-use hearsay_summarize::{Summarizer, SummarizerConfig};
 use hearsay_transcribe::{TranscribedSegment, TranscriberConfig, TranscriptionWorker};
+use serde::Serialize;
 
 struct Args {
     audio: PathBuf,
@@ -205,20 +205,66 @@ fn transcribe(args: &Args) -> Result<Vec<Segment>, String> {
         .collect())
 }
 
-fn summarize(model_path: &Path, n_ctx: u32, segments: &[Segment], language: Option<&str>) -> Result<String, String> {
-    let mut cfg = SummarizerConfig::for_model(model_path.to_path_buf());
-    cfg.n_ctx = n_ctx;
-    println!("\nLoading Gemma (n_ctx = {})…", n_ctx);
-    let started = Instant::now();
-    let summarizer = Summarizer::new(cfg).map_err(|e| format!("{e}"))?;
-    println!("Loaded in {:.1} s", started.elapsed().as_secs_f32());
+#[derive(Serialize)]
+struct ChildRequest<'a> {
+    model_path: &'a Path,
+    n_ctx: u32,
+    n_gpu_layers: u32,
+    max_tokens: u32,
+    language: Option<&'a str>,
+    segments: &'a [Segment],
+}
 
+/// Spawn `hearsay-summarize-child` (assumed to live next to this binary)
+/// to run summarization. We can't summarize in-process: llama-cpp-2 +
+/// whisper-rs collide on shared ggml state and segfault during
+/// `llama_load_model_from_file`. The daemon uses the same trick.
+fn summarize(model_path: &Path, n_ctx: u32, segments: &[Segment], language: Option<&str>) -> Result<String, String> {
+    let child_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("hearsay-summarize-child")))
+        .ok_or_else(|| "could not resolve hearsay-summarize-child path".to_owned())?;
+    if !child_path.exists() {
+        return Err(format!(
+            "summarize child binary missing at {} — build with `cargo build -p hearsayd --bin hearsay-summarize-child`",
+            child_path.display()
+        ));
+    }
+
+    let req = ChildRequest {
+        model_path,
+        n_ctx,
+        n_gpu_layers: 999,
+        max_tokens: 1_500,
+        language,
+        segments,
+    };
+    let payload = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
+
+    println!("\nSpawning {} (n_ctx = {})…", child_path.display(), n_ctx);
     let started = Instant::now();
-    let out = summarizer
-        .summarize(segments, language)
-        .map_err(|e| format!("{e}"))?;
+    let mut child = std::process::Command::new(&child_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("spawn child: {e}"))?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(&payload).map_err(|e| format!("write child stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("wait child: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "child exited with {} — see stderr above",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
     println!("Summarized in {:.1} s", started.elapsed().as_secs_f32());
-    Ok(out)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Decode a WAV via `hound`, mix down to mono, naive linear-interpolation
