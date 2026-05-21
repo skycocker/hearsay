@@ -1,0 +1,20 @@
+[package]
+name = "hearsay-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hearsay-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

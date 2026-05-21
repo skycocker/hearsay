@@ -1,0 +1,19 @@
+[package]
+name = "hearsay-meet-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hearsay-core.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,62 @@
+[package]
+name = "hearsayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hearsayd"
+path = "src/main.rs"
+
+[dependencies]
+hearsay-core.workspace = true
+hearsay-audio.workspace = true
+hearsay-storage.workspace = true
+hearsay-transcribe.workspace = true
+hearsay-summarize.workspace = true
+hearsay-meet-bridge.workspace = true
+hearsay-diarize.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
+
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+chrono.workspace = true
+ulid.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+dirs.workspace = true
+
+# tray feature is opt-in; off by default until task #12 lands.
+tray-icon = { version = "0.21", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+open = { version = "5", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSRunningApplication", "NSEvent", "NSResponder"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[features]
+default = []
+tray = ["dep:tray-icon", "dep:image", "dep:open", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:gtk"]
+
+[lints]
+workspace = true

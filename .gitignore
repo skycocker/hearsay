@@ -1,0 +1,34 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local data / runtime artifacts
+/data
+/recordings
+/.hearsay-dev
+*.opus
+*.wav
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Models (downloaded separately, not committed)
+/models
+*.bin
+*.gguf
+*.onnx
+
+# Frontend
+/ui-frontend/node_modules
+/ui-frontend/dist
+/ui-frontend/.svelte-kit
+
+# OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/settings.json.example
+
+# Logs
+*.log
