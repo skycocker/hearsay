@@ -26,6 +26,7 @@ struct Args {
     whisper_model: PathBuf,
     gemma_model: Option<PathBuf>,
     language: Option<String>,
+    n_ctx: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -34,6 +35,9 @@ fn parse_args() -> Result<Args, String> {
     let mut whisper_model: Option<PathBuf> = None;
     let mut gemma_model: Option<PathBuf> = None;
     let mut language: Option<String> = None;
+    // 4096 covers ~20 minutes of speech and keeps KV cache small enough
+    // to load Gemma 3 1B comfortably on a 16 GB box.
+    let mut n_ctx: u32 = 4096;
 
     let mut i = 0;
     while i < raw.len() {
@@ -51,6 +55,13 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
                 language = raw.get(i).cloned();
             }
+            "--n-ctx" => {
+                i += 1;
+                n_ctx = raw
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "--n-ctx wants an integer".to_owned())?;
+            }
             "-h" | "--help" => return Err("help".into()),
             _ if audio.is_none() => audio = Some(PathBuf::from(arg)),
             other => return Err(format!("unexpected argument: {other}")),
@@ -60,7 +71,7 @@ fn parse_args() -> Result<Args, String> {
 
     let audio = audio.ok_or_else(|| "missing audio file path".to_owned())?;
     let whisper_model = whisper_model.ok_or_else(|| "missing --whisper PATH".to_owned())?;
-    Ok(Args { audio, whisper_model, gemma_model, language })
+    Ok(Args { audio, whisper_model, gemma_model, language, n_ctx })
 }
 
 fn usage() {
@@ -74,6 +85,8 @@ Usage:
     --whisper      Path to a whisper.cpp ggml-*.bin model.
     --gemma        Optional path to a Gemma .gguf. Runs summarization too.
     --language     ISO-639-1 language hint, e.g. 'pl' or 'en'. Default: auto.
+    --n-ctx        Gemma context window in tokens. Default: 4096 (small,
+                   fits 1B comfortably). 32768 needs more headroom.
 
 Example:
     hearsay-pipeline meeting.wav \\
@@ -121,7 +134,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(gemma_path) = args.gemma_model.as_ref() {
-        match summarize(gemma_path, &segments, args.language.as_deref()) {
+        match summarize(gemma_path, args.n_ctx, &segments, args.language.as_deref()) {
             Ok(content) => {
                 println!("\n=== Summary ===\n");
                 println!("{content}\n");
@@ -192,9 +205,10 @@ fn transcribe(args: &Args) -> Result<Vec<Segment>, String> {
         .collect())
 }
 
-fn summarize(model_path: &Path, segments: &[Segment], language: Option<&str>) -> Result<String, String> {
-    let cfg = SummarizerConfig::for_model(model_path.to_path_buf());
-    println!("\nLoading Gemma…");
+fn summarize(model_path: &Path, n_ctx: u32, segments: &[Segment], language: Option<&str>) -> Result<String, String> {
+    let mut cfg = SummarizerConfig::for_model(model_path.to_path_buf());
+    cfg.n_ctx = n_ctx;
+    println!("\nLoading Gemma (n_ctx = {})…", n_ctx);
     let started = Instant::now();
     let summarizer = Summarizer::new(cfg).map_err(|e| format!("{e}"))?;
     println!("Loaded in {:.1} s", started.elapsed().as_secs_f32());
