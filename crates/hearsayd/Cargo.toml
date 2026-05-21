@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "hearsayd"
 path = "src/main.rs"
 
+[[bin]]
+name = "hearsay-pipeline"
+path = "src/bin/hearsay-pipeline.rs"
+
 [dependencies]
 hearsay-core.workspace = true
 hearsay-audio.workspace = true
@@ -44,6 +48,7 @@ dirs.workspace = true
 
 rust-embed = "8"
 mime_guess = "2"
+hound = "3.5"
 
 # tray feature is opt-in; off by default until task #12 lands.
 tray-icon = { version = "0.21", optional = true }
