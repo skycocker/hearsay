@@ -1,0 +1,140 @@
+//! Tracks live recording sessions in memory and keeps their associated cpal
+//! stream + WAV writer alive for the duration of the recording.
+//!
+//! The HTTP layer goes through this manager — it never touches cpal or the
+//! audio writer directly. That lets us swap sources (system audio, Meet
+//! sidecar, synthetic test source) without touching routes.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use chrono::Utc;
+use hearsay_audio::{MicCapture, start_mic};
+use hearsay_core::{SessionId, SessionMeta, SessionStatus, SourceKind};
+use hearsay_storage::{AudioWriter, Storage, WavAudioWriter};
+use parking_lot::Mutex;
+use tokio::task::JoinHandle;
+
+use crate::error::ApiError;
+
+/// Per-source-kind parameters needed at session start.
+#[derive(Debug, Clone)]
+pub enum StartParams {
+    Mic { device_id: Option<String> },
+}
+
+struct Active {
+    /// Dropping this stops the cpal stream and joins the worker thread.
+    capture: MicCapture,
+    consumer: JoinHandle<()>,
+}
+
+pub struct SessionManager {
+    storage: Storage,
+    data_dir: PathBuf,
+    active: Mutex<HashMap<SessionId, Active>>,
+}
+
+impl SessionManager {
+    pub fn new(storage: Storage, data_dir: PathBuf) -> Self {
+        Self {
+            storage,
+            data_dir,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Begin a new session. Persists [`SessionMeta`] in storage, opens the
+    /// audio source, and spawns a task that drains frames into the WAV
+    /// writer. Returns the metadata so the HTTP layer can hand it back.
+    pub fn start(
+        &self,
+        name: String,
+        language: Option<String>,
+        params: StartParams,
+    ) -> Result<SessionMeta, ApiError> {
+        match params {
+            StartParams::Mic { device_id } => self.start_mic(name, language, device_id),
+        }
+    }
+
+    fn start_mic(
+        &self,
+        name: String,
+        language: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<SessionMeta, ApiError> {
+        let id = SessionId::new();
+        let dir = self.data_dir.join("sessions").join(id.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let audio_path = dir.join("audio.wav");
+
+        let meta = SessionMeta {
+            id,
+            name,
+            source_kind: SourceKind::Mic,
+            source_meta: serde_json::json!({ "device_id": device_id }),
+            language,
+            audio_path: audio_path.clone(),
+            started_at: Utc::now(),
+            ended_at: None,
+            status: SessionStatus::Active,
+        };
+        self.storage.insert_session(&meta)?;
+
+        let (capture, mut frame_rx) = start_mic(device_id.as_deref())?;
+        let writer = WavAudioWriter::create(&audio_path)?;
+        let mut writer: Box<dyn AudioWriter> = Box::new(writer);
+
+        let storage = self.storage.clone();
+        let consumer = tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                if let Err(e) = writer.write_pcm(&frame.pcm) {
+                    tracing::error!(?e, %id, "wav writer failed; ending session");
+                    let _ = storage.finish_session(id, SessionStatus::Failed, Utc::now());
+                    return;
+                }
+                // TODO(task #6): forward frame to transcription queue here.
+            }
+            // Channel closed (stream stopped). Finalize the WAV.
+            if let Err(e) = writer.finalize() {
+                tracing::error!(?e, %id, "finalize failed");
+            }
+        });
+
+        self.active.lock().insert(id, Active { capture, consumer });
+
+        Ok(meta)
+    }
+
+    /// Stop a session: drop the capture (closes cpal stream), let the
+    /// consumer task finalize the WAV, mark the session Completed.
+    pub async fn stop(&self, id: SessionId) -> Result<SessionMeta, ApiError> {
+        let active = self
+            .active
+            .lock()
+            .remove(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("active session {id}")))?;
+        // Drop capture → closes cpal stream → frame_rx returns None → consumer
+        // task ends. We just need to await it so the WAV is fully flushed
+        // before we return.
+        drop(active.capture);
+        let _ = active.consumer.await;
+
+        self.storage.finish_session(id, SessionStatus::Completed, Utc::now())?;
+        let meta = self
+            .storage
+            .get_session(id)?
+            .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
+        Ok(meta)
+    }
+
+    pub fn is_active(&self, id: SessionId) -> bool {
+        self.active.lock().contains_key(&id)
+    }
+
+    pub fn active_ids(&self) -> Vec<SessionId> {
+        self.active.lock().keys().copied().collect()
+    }
+}
+

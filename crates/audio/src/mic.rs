@@ -1,37 +1,55 @@
 //! Live microphone capture via cpal.
 //!
-//! cpal delivers samples on a high-priority OS audio thread. That thread
-//! must never block, so the data callback only does cheap work — convert
-//! the buffer to `f32` and shove it across a crossbeam channel to a worker.
-//! The worker resamples to 16 kHz mono and emits [`AudioFrame`]s to the
-//! consumer over a tokio mpsc, decoupling the audio thread from any async
-//! runtime stalls in the consumer.
+//! `cpal::Stream` is `!Send` on macOS (it holds Core Audio handles with
+//! thread affinity). To keep `MicCapture` `Send + Sync` so it can live in
+//! the daemon's session map behind a mutex, we confine the Stream to a
+//! dedicated worker thread that also runs the resampler. The HTTP layer
+//! only ever sees the `MicCapture` handle, which is just channel ends.
+//!
+//! Data path:
+//!   cpal callback (audio thread)
+//!     → crossbeam unbounded → worker thread
+//!       (worker also owns the Stream; drop = stop)
+//!     → rubato resample → tokio mpsc → consumer
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, SampleFormat, Stream};
+use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
+use crossbeam_channel::{Receiver as XRecv, Sender as XSend};
 use hearsay_core::AudioFrame;
-use parking_lot::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::resample::{INPUT_CHUNK_FRAMES, Normalizer};
 use crate::{AudioError, TARGET_SAMPLE_RATE};
 
-/// ~20 ms at 16 kHz. Picked so live transcript UI feels responsive without
-/// stalling the worker on every callback.
+/// ~20 ms at 16 kHz.
 const FRAME_SAMPLES: usize = 320;
 
-/// Live handle on a running mic capture. Dropping it stops the stream.
+/// Handle on a running mic capture. Dropping it stops the stream and joins
+/// the worker thread. Holds only `Send + Sync` types so callers can park it
+/// behind a `Mutex<HashMap<_, _>>` without contortions.
 pub struct MicCapture {
-    _stream: Stream,
-    _worker: std::thread::JoinHandle<()>,
+    stop_tx: Option<XSend<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for MicCapture {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
 }
 
 pub fn start_mic(
     device_id: Option<&str>,
 ) -> Result<(MicCapture, UnboundedReceiver<AudioFrame>), AudioError> {
+    // Resolve the device + config on the calling thread (these types are
+    // Send), then move them into the worker which builds the Stream.
     let host = cpal::default_host();
     let device = match device_id {
         Some(id) => host
@@ -45,7 +63,7 @@ pub fn start_mic(
     let sample_rate = supported.sample_rate().0;
     let channels = supported.channels();
     let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
+    let config: StreamConfig = supported.into();
 
     tracing::info!(
         device = %device.name().unwrap_or_default(),
@@ -57,104 +75,144 @@ pub fn start_mic(
 
     let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
     let (frame_tx, frame_rx) = mpsc::unbounded_channel::<AudioFrame>();
-
-    let err_state = Arc::new(Mutex::new(None::<cpal::StreamError>));
-    let err_state_cb = Arc::clone(&err_state);
-    let err_cb = move |e: cpal::StreamError| {
-        tracing::error!(?e, "cpal stream error");
-        *err_state_cb.lock() = Some(e);
-    };
-
-    let stream = match sample_format {
-        SampleFormat::F32 => device.build_input_stream(
-            &config,
-            move |data: &[f32], _| {
-                let _ = raw_tx.send(data.to_vec());
-            },
-            err_cb,
-            None,
-        )?,
-        SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _| {
-                let v: Vec<f32> = data.iter().map(|&s| s.to_sample::<f32>()).collect();
-                let _ = raw_tx.send(v);
-            },
-            err_cb,
-            None,
-        )?,
-        SampleFormat::U16 => device.build_input_stream(
-            &config,
-            move |data: &[u16], _| {
-                let v: Vec<f32> = data.iter().map(|&s| s.to_sample::<f32>()).collect();
-                let _ = raw_tx.send(v);
-            },
-            err_cb,
-            None,
-        )?,
-        other => {
-            tracing::error!(?other, "unsupported sample format");
-            return Err(AudioError::NoSupportedConfig);
-        }
-    };
-
-    stream.play()?;
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
     let worker = std::thread::Builder::new()
-        .name("hearsay-mic-worker".into())
-        .spawn(move || worker_loop(raw_rx, frame_tx, sample_rate, channels))
+        .name("hearsay-mic".into())
+        .spawn(move || {
+            // The Stream gets built and dropped on THIS thread — the entire
+            // !Send lifetime stays here.
+            let stream = match build_stream(&device, &config, sample_format, raw_tx.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(?e, "failed to build cpal stream");
+                    return;
+                }
+            };
+            if let Err(e) = stream.play() {
+                tracing::error!(?e, "failed to start cpal stream");
+                return;
+            }
+            // Drop our copy so only the cpal callback holds a sender; when
+            // the stream drops, the callback's sender drops too.
+            drop(raw_tx);
+
+            run_worker(raw_rx, frame_tx, sample_rate, channels, stop_rx);
+
+            // stream drops here → cpal stops the callback
+            drop(stream);
+        })
         .expect("spawn mic worker");
 
     Ok((
         MicCapture {
-            _stream: stream,
-            _worker: worker,
+            stop_tx: Some(stop_tx),
+            worker: Some(worker),
         },
         frame_rx,
     ))
 }
 
-fn worker_loop(
-    raw_rx: crossbeam_channel::Receiver<Vec<f32>>,
+fn build_stream(
+    device: &Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    raw_tx: XSend<Vec<f32>>,
+) -> Result<Stream, AudioError> {
+    let err_cb = |e: cpal::StreamError| {
+        tracing::error!(?e, "cpal stream error");
+    };
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let tx = raw_tx;
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    let _ = tx.send(data.to_vec());
+                },
+                err_cb,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let tx = raw_tx;
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    let v: Vec<f32> = data.iter().map(|&s| s.to_sample::<f32>()).collect();
+                    let _ = tx.send(v);
+                },
+                err_cb,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let tx = raw_tx;
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    let v: Vec<f32> = data.iter().map(|&s| s.to_sample::<f32>()).collect();
+                    let _ = tx.send(v);
+                },
+                err_cb,
+                None,
+            )?
+        }
+        other => {
+            tracing::error!(?other, "unsupported sample format");
+            return Err(AudioError::NoSupportedConfig);
+        }
+    };
+    Ok(stream)
+}
+
+fn run_worker(
+    raw_rx: XRecv<Vec<f32>>,
     frame_tx: UnboundedSender<AudioFrame>,
     source_rate: u32,
     channels: u16,
+    stop_rx: XRecv<()>,
 ) {
     let mut normalizer = match Normalizer::new(source_rate, channels) {
         Ok(n) => n,
         Err(e) => {
-            tracing::error!(?e, "failed to build resampler; worker exiting");
+            tracing::error!(?e, "failed to build resampler");
             return;
         }
     };
-
     let mut out_buf: Vec<f32> = Vec::with_capacity(INPUT_CHUNK_FRAMES * 2);
-    let mut frame_pcm: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
 
-    while let Ok(raw) = raw_rx.recv() {
-        if let Err(e) = normalizer.push(&raw, &mut out_buf) {
-            tracing::error!(?e, "resampler failed; worker exiting");
-            return;
-        }
+    loop {
+        crossbeam_channel::select! {
+            recv(stop_rx) -> _ => return,
+            recv(raw_rx) -> msg => {
+                let raw = match msg {
+                    Ok(v) => v,
+                    Err(_) => return, // sender side closed (stream dropped)
+                };
+                if let Err(e) = normalizer.push(&raw, &mut out_buf) {
+                    tracing::error!(?e, "resampler failed; worker exiting");
+                    return;
+                }
 
-        // Drain `out_buf` into fixed-size AudioFrames.
-        let captured_at = Instant::now();
-        let mut idx = 0;
-        while idx + FRAME_SAMPLES <= out_buf.len() {
-            frame_pcm.clear();
-            frame_pcm.extend_from_slice(&out_buf[idx..idx + FRAME_SAMPLES]);
-            let frame = AudioFrame {
-                pcm: std::mem::replace(&mut frame_pcm, Vec::with_capacity(FRAME_SAMPLES)),
-                sample_rate: TARGET_SAMPLE_RATE,
-                channels: 1,
-                captured_at,
-            };
-            if frame_tx.send(frame).is_err() {
-                // Consumer dropped — clean shutdown.
-                return;
+                let captured_at = Instant::now();
+                let mut idx = 0;
+                while idx + FRAME_SAMPLES <= out_buf.len() {
+                    let mut pcm = Vec::with_capacity(FRAME_SAMPLES);
+                    pcm.extend_from_slice(&out_buf[idx..idx + FRAME_SAMPLES]);
+                    let frame = AudioFrame {
+                        pcm,
+                        sample_rate: TARGET_SAMPLE_RATE,
+                        channels: 1,
+                        captured_at,
+                    };
+                    if frame_tx.send(frame).is_err() {
+                        return;
+                    }
+                    idx += FRAME_SAMPLES;
+                }
+                out_buf.drain(..idx);
             }
-            idx += FRAME_SAMPLES;
         }
-        out_buf.drain(..idx);
     }
 }

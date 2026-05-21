@@ -58,5 +58,10 @@ gtk = { version = "0.18", optional = true }
 default = []
 tray = ["dep:tray-icon", "dep:image", "dep:open", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:gtk"]
 
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
 [lints]
 workspace = true
