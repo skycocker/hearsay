@@ -19,7 +19,7 @@ hearsay-meet-bridge.workspace = true
 hearsay-diarize.workspace = true
 
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tokio-stream.workspace = true
 futures-util.workspace = true
 
@@ -62,6 +62,8 @@ tray = ["dep:tray-icon", "dep:image", "dep:open", "dep:objc2-foundation", "dep:o
 tempfile = "3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.28"
+futures-util = { workspace = true }
 
 [lints]
 workspace = true

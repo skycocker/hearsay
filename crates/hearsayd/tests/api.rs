@@ -184,3 +184,105 @@ async fn bad_session_id_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn get_config_returns_loaded_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build(dir.path());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["server"]["port"], 7717);
+    assert_eq!(body["summarization"]["model"], "gemma3-12b-q4");
+}
+
+#[tokio::test]
+async fn audio_download_streams_wav_file() {
+    use hearsay_storage::{AudioWriter, WavAudioWriter};
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = build(dir.path());
+
+    // Write a tiny real WAV so the audio download has something to serve.
+    let audio_path = dir.path().join("audio.wav");
+    let mut w: Box<dyn AudioWriter> = Box::new(WavAudioWriter::create(&audio_path).unwrap());
+    w.write_pcm(&vec![0.1_f32; 1_600]).unwrap();
+    w.finalize().unwrap();
+    let expected_bytes = std::fs::read(&audio_path).unwrap();
+
+    // Seed the session pointing at that file.
+    let storage = Storage::open(dir.path().join("h.db")).unwrap();
+    let id = SessionId::new();
+    storage
+        .insert_session(&SessionMeta {
+            id,
+            name: "audio test".into(),
+            source_kind: SourceKind::Mic,
+            source_meta: serde_json::Value::Null,
+            language: None,
+            audio_path,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Completed,
+        })
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/audio"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "audio/wav"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), expected_bytes.as_slice());
+}
+
+#[tokio::test]
+async fn audio_download_404_for_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = build(dir.path());
+
+    // Session exists but its audio_path points nowhere on disk.
+    let storage = Storage::open(dir.path().join("h.db")).unwrap();
+    let id = SessionId::new();
+    storage
+        .insert_session(&SessionMeta {
+            id,
+            name: "ghost".into(),
+            source_kind: SourceKind::Mic,
+            source_meta: serde_json::Value::Null,
+            language: None,
+            audio_path: dir.path().join("missing.wav"),
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Completed,
+        })
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/audio"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

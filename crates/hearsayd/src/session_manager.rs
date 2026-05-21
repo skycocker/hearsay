@@ -10,12 +10,19 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use hearsay_audio::{MicCapture, start_mic};
-use hearsay_core::{SessionId, SessionMeta, SessionStatus, SourceKind};
+use hearsay_core::{Segment, SessionId, SessionMeta, SessionStatus, SourceKind};
 use hearsay_storage::{AudioWriter, Storage, WavAudioWriter};
 use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::error::ApiError;
+
+/// Capacity of the per-session live transcript broadcast. Big enough that
+/// a slow WS client doesn't drop segments under normal speaking pace, small
+/// enough that a totally-stalled subscriber doesn't pin the whole session's
+/// transcript in RAM.
+const LIVE_BROADCAST_CAPACITY: usize = 256;
 
 /// Per-source-kind parameters needed at session start.
 #[derive(Debug, Clone)]
@@ -27,6 +34,9 @@ struct Active {
     /// Dropping this stops the cpal stream and joins the worker thread.
     capture: MicCapture,
     consumer: JoinHandle<()>,
+    /// Producer side for the live-transcript WS. Dropping this when the
+    /// session ends gives all live subscribers a clean disconnect signal.
+    live_tx: broadcast::Sender<Segment>,
 }
 
 pub struct SessionManager {
@@ -102,9 +112,30 @@ impl SessionManager {
             }
         });
 
-        self.active.lock().insert(id, Active { capture, consumer });
+        let (live_tx, _live_rx_drop) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
+        self.active
+            .lock()
+            .insert(id, Active { capture, consumer, live_tx });
 
         Ok(meta)
+    }
+
+    /// Subscribe to the live transcript stream for an active session.
+    /// Returns `None` if the session isn't active.
+    pub fn subscribe_live(&self, id: SessionId) -> Option<broadcast::Receiver<Segment>> {
+        self.active.lock().get(&id).map(|a| a.live_tx.subscribe())
+    }
+
+    /// Publish a transcript segment to the live broadcast. Returns the
+    /// number of subscribers reached (0 is normal — nobody might be
+    /// watching). Called by the transcription pipeline (task #6).
+    #[allow(dead_code)]
+    pub fn publish_segment(&self, id: SessionId, seg: Segment) -> usize {
+        self.active
+            .lock()
+            .get(&id)
+            .map(|a| a.live_tx.send(seg).unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Stop a session: drop the capture (closes cpal stream), let the
