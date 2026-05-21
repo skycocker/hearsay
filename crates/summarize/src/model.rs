@@ -32,6 +32,15 @@ fn backend() -> Result<&'static LlamaBackend, SummarizeError> {
         return Ok(b);
     }
     let b = LlamaBackend::init().map_err(|e| SummarizeError::Llama(format!("{e:?}")))?;
+    // Install our own log callback before any model load so llama.cpp
+    // doesn't hit ggml's default stderr printer — which, when whisper-rs
+    // has already initialized ggml in the same process, crashes inside
+    // vsnprintf with a bad string pointer. Verified on macOS 14.8 / M2 Pro
+    // with llama-cpp-2 0.1.146: without this call,
+    // `llama_load_model_from_file` segfaults in `llama_log_internal`.
+    llama_cpp_2::send_logs_to_tracing(
+        llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+    );
     Ok(BACKEND.get_or_init(|| b))
 }
 
