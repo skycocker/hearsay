@@ -11,6 +11,9 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let starting = $state(false);
+  // Which session id has the "really delete?" prompt open. `null` = none.
+  let pendingDelete = $state<string | null>(null);
+  let deletingId = $state<string | null>(null);
 
   async function refresh() {
     try {
@@ -25,6 +28,33 @@
       error = (e as Error).message;
     } finally {
       loading = false;
+    }
+  }
+
+  function askDelete(id: string, event: Event) {
+    event.preventDefault();
+    event.stopPropagation();
+    pendingDelete = id;
+  }
+
+  function cancelDelete(event: Event) {
+    event.preventDefault();
+    event.stopPropagation();
+    pendingDelete = null;
+  }
+
+  async function confirmDelete(id: string, event: Event) {
+    event.preventDefault();
+    event.stopPropagation();
+    deletingId = id;
+    try {
+      await api.deleteSession(id);
+      sessions = sessions.filter((s) => s.id !== id);
+      pendingDelete = null;
+    } catch (e) {
+      error = `Failed to delete: ${(e as Error).message}`;
+    } finally {
+      deletingId = null;
     }
   }
 
@@ -100,7 +130,39 @@
           <a href="#/sessions/{s.id}" class="card">
             <div class="row">
               <span class="name">{s.name}</span>
-              <span class="status" data-status={s.status}>{s.status}</span>
+              <span class="card-actions">
+                <span class="status" data-status={s.status}>{s.status}</span>
+                {#if pendingDelete === s.id}
+                  <span class="confirm-row">
+                    <span class="confirm-text">Delete this recording?</span>
+                    <button
+                      type="button"
+                      class="delete-confirm"
+                      disabled={deletingId === s.id}
+                      onclick={(e) => confirmDelete(s.id, e)}
+                    >
+                      {deletingId === s.id ? "Deleting…" : "Yes, destroy"}
+                    </button>
+                    <button
+                      type="button"
+                      class="delete-cancel"
+                      disabled={deletingId === s.id}
+                      onclick={cancelDelete}
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                {:else}
+                  <button
+                    type="button"
+                    class="delete-btn"
+                    aria-label="Delete recording"
+                    onclick={(e) => askDelete(s.id, e)}
+                  >
+                    ×
+                  </button>
+                {/if}
+              </span>
             </div>
             <div class="meta">
               <span>{s.source_kind === "mic" ? "Mic" : s.source_kind === "system_audio" ? "System audio" : "Meet"}</span>
@@ -212,6 +274,61 @@
   .status[data-status="failed"] {
     background: #f5d6d1;
     color: #872a1f;
+  }
+  .card-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .delete-btn {
+    /* Subtle by default; gets prominent on hover so a casual click doesn't
+       wipe a meeting. */
+    background: transparent;
+    border: 1px solid transparent;
+    color: #b0b0ad;
+    font-size: 1.1rem;
+    line-height: 1;
+    padding: 0 0.45rem;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 120ms, background 120ms, border-color 120ms;
+  }
+  .delete-btn:hover {
+    color: #872a1f;
+    background: #fbe7e4;
+    border-color: #f0c8c2;
+  }
+  .confirm-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .confirm-text {
+    font-size: 0.78rem;
+    color: #555;
+  }
+  .delete-confirm,
+  .delete-cancel {
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 4px;
+    border: 1px solid #d0d0cc;
+    background: #fff;
+    cursor: pointer;
+  }
+  .delete-confirm {
+    background: #b73a2b;
+    color: #fff;
+    border-color: #b73a2b;
+  }
+  .delete-confirm:hover {
+    background: #9c2e22;
+  }
+  .delete-confirm:disabled,
+  .delete-cancel:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .meta {
     display: flex;

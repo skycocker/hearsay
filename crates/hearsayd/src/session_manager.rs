@@ -278,6 +278,32 @@ impl SessionManager {
     pub fn active_ids(&self) -> Vec<SessionId> {
         self.active.lock().keys().copied().collect()
     }
+
+    /// "Destroy" a session: drop the DB row (which cascades to segments,
+    /// speakers, summaries) AND remove the audio file from disk. Refuses
+    /// if the session is still recording.
+    pub fn destroy(&self, id: SessionId) -> Result<(), ApiError> {
+        if self.is_active(id) {
+            return Err(ApiError::BadRequest(
+                "session is active; stop it first".into(),
+            ));
+        }
+        // Look up the audio path before we delete the row.
+        if let Some(meta) = self.storage.get_session(id)? {
+            if meta.audio_path.exists() {
+                if let Err(e) = std::fs::remove_file(&meta.audio_path) {
+                    tracing::warn!(?e, path = %meta.audio_path.display(),
+                        "failed to remove audio file; deleting DB rows anyway");
+                }
+            }
+            // Best-effort: nuke the session's directory if it's now empty.
+            if let Some(parent) = meta.audio_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        self.storage.delete_session(id)?;
+        Ok(())
+    }
 }
 
 async fn run_summarization(

@@ -58,12 +58,7 @@ pub async fn delete(
     let id: SessionId = id
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid session id: {id}")))?;
-    if state.sessions.is_active(id) {
-        return Err(ApiError::BadRequest(
-            "session is active; stop it first".into(),
-        ));
-    }
-    state.storage.delete_session(id)?;
+    state.sessions.destroy(id)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
