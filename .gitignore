@@ -23,6 +23,8 @@ Cargo.lock.bak
 /ui-frontend/node_modules
 /ui-frontend/dist
 /ui-frontend/.svelte-kit
+/ui-frontend/.vite
+/ui-frontend/README.md
 
 # OS
 .DS_Store

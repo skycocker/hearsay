@@ -10,6 +10,7 @@ pub mod config;
 pub mod devices;
 pub mod health;
 pub mod sessions;
+pub mod static_files;
 pub mod ws;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -29,5 +30,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .nest("/api", api)
         .nest("/ws", ws_routes)
+        .fallback(static_files::serve)
         .with_state(state)
 }
